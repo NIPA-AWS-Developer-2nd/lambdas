@@ -1,0 +1,22 @@
+{
+  "name": "separate-storage-image-optimizer",
+  "version": "1.0.0",
+  "description": "Lambda function that stores original and optimized images separately",
+  "main": "index.js",
+  "dependencies": {
+    "sharp": "^0.32.0",
+    "aws-sdk": "^2.1400.0"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "aws",
+    "lambda",
+    "image",
+    "optimization",
+    "sharp"
+  ],
+  "author": "",
+  "license": "MIT"
+}
