@@ -5,9 +5,15 @@ from decimal import Decimal
 from datetime import datetime, timezone
 
 dynamodb = boto3.resource('dynamodb')
+s3 = boto3.client('s3')
 
 DRAFT_TABLE_NAME = os.getenv('DRAFT_TABLE_NAME', 'MissionDrafts')
 LIVE_TABLE_NAME  = os.getenv('LIVE_TABLE_NAME',  'Missions_Live')
+
+# 이미지 버킷/프리픽스 (관리자 페이지 업로드 규칙과 일치)
+PROMPTS_BUCKET   = os.getenv('PROMPTS_BUCKET', 'halsaram-prompts')
+THUMBNAIL_PREFIX = os.getenv('THUMBNAIL_PREFIX', 'thumbnail/')
+GUIDES_PREFIX    = os.getenv('GUIDES_PREFIX', 'guides/')
 
 draft_table = dynamodb.Table(DRAFT_TABLE_NAME)
 live_table  = dynamodb.Table(LIVE_TABLE_NAME)
@@ -18,27 +24,22 @@ def _as_int(v, default=0):
         return int(v)
     except Exception:
         try:
-            # Decimal 등
             return int(Decimal(str(v)))
         except Exception:
             return default
 
 def _ensure_list_str(x):
-    # 문자열이면 쉼표 기준 분리 → 트림 → 빈값 제거
     if x is None:
         return []
     if isinstance(x, list):
-        # list 안이 dict/기타면 문자열화
         return [str(s) for s in x]
     if isinstance(x, str):
         parts = [p.strip() for p in x.split(',')]
         return [p for p in parts if p]
-    # 그 외 타입은 문자열화해서 단건 리스트
     return [str(x)]
 
 def _get_str(new_image, key):
     node = new_image.get(key) or {}
-    # Streams는 타입래퍼(S, N, L…)로 옴
     if 'S' in node: return node['S']
     if 'N' in node: return node['N']
     return None
@@ -50,6 +51,20 @@ def _get_json_str_field(new_image, key):
         return json.loads(s)
     except Exception:
         return None
+
+def _looks_like_url(v: str) -> bool:
+    return isinstance(v, str) and (v.startswith('http://') or v.startswith('https://'))
+
+def _to_https_url(bucket: str, key: str) -> str:
+    # S3 퍼블릭 버킷으로 열어둔 상태라고 하셨으니 단순 URL 구성
+    return f"https://{bucket}.s3.amazonaws.com/{key}"
+
+def _head_ok(bucket: str, key: str) -> bool:
+    try:
+        s3.head_object(Bucket=bucket, Key=key)
+        return True
+    except Exception:
+        return False
 
 def lambda_handler(event, context):
     print("Received event:", json.dumps(event)[:2000])
@@ -64,7 +79,7 @@ def lambda_handler(event, context):
         new_status = (new_img.get('status', {}) or {}).get('S')
         old_status = (old_img.get('status', {}) or {}).get('S')
 
-        # 'APPROVED'로 새로 전이된 경우에만 처리
+        # 'APPROVED'로 새로 전이된 경우만 처리
         if new_status != 'APPROVED' or old_status == 'APPROVED':
             continue
 
@@ -73,73 +88,125 @@ def lambda_handler(event, context):
             print("[SKIP] mission_id missing")
             continue
 
-        # Draft에 저장해둔 생성 결과(JSON 문자열) 파싱
+        # Draft에 저장해둔 생성 결과(JSON 문자열)
         mission_data = _get_json_str_field(new_img, 'mission_data') or {}
 
+        # 1) 기본 필드 매핑
+        name_kr  = mission_data.get('Mission_Name_KR')
+        category = mission_data.get('Interest_Category')
+        tags     = _ensure_list_str(mission_data.get('Secondary_Tags'))
+        steps    = _ensure_list_str(mission_data.get('Verification_Steps'))
+
+        intro_kr          = mission_data.get('Intro_KR') or ""
+        estimated_minutes = _as_int(mission_data.get('Estimated_Minutes'))
+        cautions_kr       = _ensure_list_str(mission_data.get('Cautions_KR'))
+
+        difficulty   = _as_int(mission_data.get('Difficulty_Level'), 1)
+        participants = _as_int(mission_data.get('Required_Participants'), 3)
+
+        point_rule = mission_data.get('Point_Rule') or ""
+
+        # 2) 썸네일/가이드 URL 결정 로직
+        # 2-1) Streams NewImage에 백엔드가 키를 직접 넣어줬는지
+        thumbnail_key = _get_str(new_img, 'thumbnail_key')  # 예: "thumbnail/{mission_id}_1.jpg"
+        guide_keys    = _ensure_list_str(_get_str(new_img, 'guide_keys'))  # 콤마 문자열일 수도 있어 처리
+
+        # 2-2) mission_data에 URL로만 들어있는 경우(기존 호환)
+        thumbnail_url_md = mission_data.get('Thumbnail_URL') or ""
+        sample_urls_md   = _ensure_list_str(mission_data.get('Sample_Image_URLs'))
+
+        # 2-3) 최종 URL 조합
+        if thumbnail_key:
+            if not _looks_like_url(thumbnail_key):
+                # 키라면 URL로 변환
+                if not thumbnail_key.startswith(THUMBNAIL_PREFIX):
+                    # 안전장치: 의도와 다르면 접두어 보정
+                    thumbnail_key = THUMBNAIL_PREFIX + thumbnail_key
+                # 존재 보강(선택)
+                if _head_ok(PROMPTS_BUCKET, thumbnail_key):
+                    thumbnail_url = _to_https_url(PROMPTS_BUCKET, thumbnail_key)
+                else:
+                    print(f"[WARN] thumbnail object not found: s3://{PROMPTS_BUCKET}/{thumbnail_key}")
+                    thumbnail_url = _to_https_url(PROMPTS_BUCKET, thumbnail_key)  # 그래도 기록
+            else:
+                thumbnail_url = thumbnail_key
+        else:
+            # 키가 없다면 mission_data의 URL(혹은 빈값)
+            thumbnail_url = thumbnail_url_md
+
+        final_sample_urls = []
+        if guide_keys:
+            for k in guide_keys:
+                k = k.strip()
+                if not k:
+                    continue
+                if _looks_like_url(k):
+                    final_sample_urls.append(k)
+                else:
+                    # 키라면 접두어 보정
+                    if not (k.startswith(GUIDES_PREFIX) or k.startswith(THUMBNAIL_PREFIX)):
+                        k = GUIDES_PREFIX + k
+                    if _head_ok(PROMPTS_BUCKET, k):
+                        final_sample_urls.append(_to_https_url(PROMPTS_BUCKET, k))
+                    else:
+                        print(f"[WARN] guide object not found: s3://{PROMPTS_BUCKET}/{k}")
+                        final_sample_urls.append(_to_https_url(PROMPTS_BUCKET, k))
+        else:
+            # 키가 없다면 mission_data의 URL 리스트 사용(혹은 빈 리스트)
+            final_sample_urls = sample_urls_md
+
+        # 3) Live 아이템 구성
+        now_iso = datetime.now(timezone.utc).isoformat()
+        live_item = {
+            'mission_id': mission_id,
+            'name': name_kr,
+            'category': category,
+            'tags': tags,
+            'difficulty': difficulty,
+            'participants': participants,
+            'steps': steps,
+            'intro': intro_kr,
+            'estimated_minutes': estimated_minutes,
+            'cautions': cautions_kr,
+            'thumbnail_url': thumbnail_url,
+            'sample_image_urls': final_sample_urls,
+            'point_rule_text': point_rule,
+            'created_at': now_iso,
+            'updated_at': now_iso,
+        }
+
         try:
-            # ---- 필드 매핑(프론트/백엔 팀원이 쓰기 편한 형태) ----
-            name_kr  = mission_data.get('Mission_Name_KR')
-            category = mission_data.get('Interest_Category')
-            tags     = _ensure_list_str(mission_data.get('Secondary_Tags'))  # 문자열배열 강제
-            steps    = _ensure_list_str(mission_data.get('Verification_Steps'))
-
-            # 선택/신규 필드들
-            intro_kr          = mission_data.get('Intro_KR')                    # 소개문
-            estimated_minutes = _as_int(mission_data.get('Estimated_Minutes'))  # 예상 소요
-            cautions_kr       = _ensure_list_str(mission_data.get('Cautions_KR'))
-            # 썸네일/가이드는 관리자 페이지에서 업로드 → S3 경로를 나중에 채움
-            thumbnail_url     = mission_data.get('Thumbnail_URL') or ""
-            sample_image_urls = _ensure_list_str(mission_data.get('Sample_Image_URLs'))
-
-            # 난이도/인원
-            difficulty   = _as_int(mission_data.get('Difficulty_Level'), 1)
-            participants = _as_int(mission_data.get('Required_Participants'), 3)
-
-            # 포인트 규칙(계산은 외부 모듈) — 텍스트로 남겨도 무방
-            point_rule = mission_data.get('Point_Rule')  # 예: "기본 500 * 인원수 * 난이도"
-
-            # 최종 Live 레코드
-            live_item = {
-                'mission_id': mission_id,
-                'name': name_kr,
-                'category': category,                 # "음식" | "문화/예술" | "스포츠" | "반려동물"
-                'tags': tags,                         # text[]
-                'difficulty': difficulty,             # int
-                'participants': participants,         # int
-                'steps': steps,                       # text[]
-                'intro': intro_kr or "",              # text
-                'estimated_minutes': estimated_minutes,   # int
-                'cautions': cautions_kr,              # text[]
-                'thumbnail_url': thumbnail_url,       # text
-                'sample_image_urls': sample_image_urls,   # text[]
-                'point_rule_text': point_rule or "",  # 계산은 외부 모듈, 텍스트로만 보존
-                'created_at': datetime.now(timezone.utc).isoformat(),
-                'updated_at': datetime.now(timezone.utc).isoformat(),
-            }
-
-            # 이미 존재하면 덮어쓰지 않도록(중복 방지) — 필요 시 UPSERT로 바꿀 수 있음
             live_table.put_item(
                 Item=live_item,
                 ConditionExpression='attribute_not_exists(mission_id)'
             )
             print(f"[LIVE][OK] {mission_id}")
-
-            # Draft 상태 갱신(선택) — 이미 APPROVED인 걸 PROCESSED로 바꾸고 싶을 때
-            draft_table.update_item(
+        except live_table.meta.client.exceptions.ConditionalCheckFailedException:
+            # 이미 있으면 업데이트(썸네일/가이드만 갱신되는 경우 대비)
+            live_table.update_item(
                 Key={'mission_id': mission_id},
-                UpdateExpression="SET #s = :processed",
-                ExpressionAttributeNames={'#s': 'status'},
-                ExpressionAttributeValues={':processed': 'PROCESSED'}
+                UpdateExpression=(
+                    "SET #n=:n, category=:c, tags=:t, difficulty=:d, participants=:p, "
+                    "steps=:s, intro=:i, estimated_minutes=:em, cautions=:ca, "
+                    "thumbnail_url=:th, sample_image_urls=:si, point_rule_text=:pr, "
+                    "updated_at=:u"
+                ),
+                ExpressionAttributeNames={'#n': 'name'},
+                ExpressionAttributeValues={
+                    ':n': name_kr, ':c': category, ':t': tags, ':d': difficulty, ':p': participants,
+                    ':s': steps, ':i': intro_kr, ':em': estimated_minutes, ':ca': cautions_kr,
+                    ':th': thumbnail_url, ':si': final_sample_urls, ':pr': point_rule, ':u': now_iso
+                }
             )
-            print(f"[DRAFT][MARKED PROCESSED] {mission_id}")
+            print(f"[LIVE][UPSERT] {mission_id}")
 
-        except draft_table.meta.client.exceptions.ConditionalCheckFailedException:
-            # 이미 Live에 있음 → 스킵
-            print(f"[LIVE][SKIP] already exists: {mission_id}")
-            continue
-        except Exception as e:
-            print(f"[ERROR] mission_id={mission_id} err={e}")
-            # 실패는 레코드만 스킵하고 다음으로 진행
-            continue
+        # Draft는 PROCESSED로 마킹(중복 방지)
+        draft_table.update_item(
+            Key={'mission_id': mission_id},
+            UpdateExpression="SET #s = :processed",
+            ExpressionAttributeNames={'#s': 'status'},
+            ExpressionAttributeValues={':processed': 'PROCESSED'}
+        )
+        print(f"[DRAFT][MARKED PROCESSED] {mission_id}")
 
     return {'statusCode': 200, 'body': json.dumps('ok')}
