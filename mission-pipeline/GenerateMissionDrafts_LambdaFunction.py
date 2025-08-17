@@ -22,9 +22,8 @@ GENERATE_PROMPTS_PREFIX = os.getenv('GENERATE_PROMPTS_PREFIX', 'generatePrompts/
 
 MODEL_ID_DEFAULT = 'anthropic.claude-3-haiku-20240307-v1:0'  # fallback
 
-# ---- S3 helpers (❗누락되면 NameError)
+# ---- S3 helpers
 def _get_latest_key(bucket: str, prefix: str) -> str:
-    """prefix 내에서 마지막 수정시간이 가장 최신인 객체 Key를 반환 (폴더 객체 제외)."""
     continuation = None
     latest = None
     while True:
@@ -82,12 +81,6 @@ def _as_text_content(s: str):
     return [{"type": "text", "text": s}]
 
 def build_few_shot_messages(prompt_config):
-    """
-    few_shot_examples 지원 형태:
-    - [{"user":"...","assistant":"..."}]
-    - [{"input":"...","output":"..."}]
-    - [{"Mission_Name_KR":...}]  -> assistant-only 예시로 변환
-    """
     messages = []
     examples = prompt_config.get('few_shot_examples', [])
     for ex in examples:
@@ -171,31 +164,43 @@ def lambda_handler(event, context):
     extra_missions = (event or {}).get("extra_missions") or []
     print("[SAVE] model_missions:", len(model_missions), "extra_missions:", len(extra_missions))
 
-    # 배치 내 중복 mission_id 방지 집합
     seen_ids = set()
 
-    def _normalize_and_validate(m: dict) -> dict | None:
-        # 필수 필드
+    def _normalize_and_validate(m: dict):
+        # 필수
         name = m.get("Mission_Name_KR")
         steps = m.get("Verification_Steps")
         if not name or not isinstance(steps, list) or not steps:
             print("[SKIP] required fields missing:", {"Mission_Name_KR": name, "steps_type": type(steps)})
             return None
 
-        # Secondary_Tags: 문자열 -> 배열(콤마 분리)
+        # 태그: 문자열→배열 방어
         tags = m.get("Secondary_Tags")
         if isinstance(tags, str):
             tags = [t.strip() for t in tags.split(",") if t.strip()]
-            m["Secondary_Tags"] = tags
         elif not isinstance(tags, list):
-            m["Secondary_Tags"] = []
+            tags = []
+        m["Secondary_Tags"] = tags
 
-        # 정수 필드 정규화
+        # 정수 필드
         for k in ("Difficulty_Level", "Required_Participants", "Estimated_Minutes"):
             if k in m and isinstance(m[k], str) and m[k].isdigit():
                 m[k] = int(m[k])
 
-        # Scoring 기본값 보강
+        # 안전/소개 필드 기본값
+        m.setdefault("Cautions_KR", [])
+        m.setdefault("Intro_KR", "")
+
+        # ❗썸네일/가이드는 새 표준 키만 사용
+        m["thumbnail_url"] = str(m.get("thumbnail_url") or "")
+        g = m.get("guides_urls")
+        if isinstance(g, str):
+            g = [p.strip() for p in g.split(",") if p.strip()]
+        elif not isinstance(g, list):
+            g = []
+        m["guides_urls"] = g
+
+        # 점수 규칙 텍스트(표시용)
         m.setdefault("Scoring", {})
         sc = m["Scoring"]
         sc.setdefault("Base_Per_Person", 500)
@@ -203,16 +208,15 @@ def lambda_handler(event, context):
         sc.setdefault("Difficulty_Multiplier", m.get("Difficulty_Level", 1))
         sc.setdefault("Host_Bonus", 200)
         sc.setdefault("Duplicate_Penalty_Factor", 0.5)
-
-        # Point_Rule 문자열 생성
         try:
-            base = int(sc["Base_Per_Person"])
-            ppl  = int(sc["Participants"])
-            diff = int(sc["Difficulty_Multiplier"])
+            base = int(sc["Base_Per_Person"]); ppl = int(sc["Participants"]); diff = int(sc["Difficulty_Multiplier"])
             m["Point_Rule"] = f"기본 {base} * 인원수({ppl}) * 난이도({diff}) = {base*ppl*diff} 포인트"
         except Exception:
             pass
 
+        # ❌ 구 키 제거
+        m.pop("Thumbnail_URL", None)
+        m.pop("Sample_Image_URLs", None)
         return m
 
     all_missions = (model_missions if isinstance(model_missions, list) else []) + extra_missions
@@ -223,7 +227,6 @@ def lambda_handler(event, context):
         if not nm:
             continue
 
-        # 외부에서 mission_id 지정 가능 (예: test-norunsan-001)
         mission_id = nm.get("mission_id") or str(uuid.uuid4())
         if mission_id in seen_ids:
             print("[SKIP] duplicated in batch:", mission_id)
@@ -249,18 +252,11 @@ def lambda_handler(event, context):
             webhook_url = get_slack_webhook_url()
             slack_message = {
                 "blocks": [
-                    {
-                        "type": "section",
-                        "text": {"type": "mrkdwn",
-                                 "text": f"🔔 *새 미션 {created}개가 검수를 기다립니다!*"}
-                    },
-                    {
-                        "type": "section",
-                        "text": {"type": "mrkdwn",
-                                 "text": "👉 관리자 페이지에서 승인/반려를 진행해주세요.\n"
-                                         "• URL: https://admin.halsaram.site/\n"
-                                         "• 접속 시, 발급된 *인증키*를 입력해 주세요."}
-                    }
+                    {"type": "section", "text": {"type": "mrkdwn", "text": f"🔔 *새 미션 {created}개가 검수를 기다립니다!*"}},
+                    {"type": "section", "text": {"type": "mrkdwn", "text":
+                        "👉 관리자 페이지에서 승인/반려를 진행해주세요.\n"
+                        "• URL: https://admin.halsaram.site/\n"
+                        "• 접속 시, 발급된 *인증키*를 입력해 주세요."}}
                 ]
             }
             req = urllib.request.Request(
